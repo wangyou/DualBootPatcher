@@ -33,16 +33,17 @@
 #include "utilities.h"
 #else
 #include "appsync.h"
+#include "auditd.h"
 #include "daemon.h"
+#include "decrypt.h"
 #include "init.h"
 #include "miniadbd.h"
-#include "mount_fstab.h"
 #include "sepolpatch.h"
 #include "signature.h"
 #include "uevent_dump.h"
 #endif
-#include "version.h"
 
+#include "mbcommon/version.h"
 #include "mblog/logging.h"
 #include "mbutil/process.h"
 #include "mbutil/string.h"
@@ -62,6 +63,7 @@ struct tool {
 
 struct tool tools[] = {
     { "mbtool", mbtool_main },
+    { "mbtool_recovery", mbtool_main },
     // Tools
 #ifdef RECOVERY
     { "backup", mb::backup_main },
@@ -74,10 +76,11 @@ struct tool tools[] = {
 #else
     { "adbd", mb::miniadbd_main },
     { "appsync", mb::appsync_main },
+    { "auditd", mb::auditd_main },
     { "daemon", mb::daemon_main },
+    { "decrypt", mb::decrypt_main },
     { "init", mb::init_main },
     { "miniadbd", mb::miniadbd_main },
-    { "mount_fstab", mb::mount_fstab_main },
     { "sepolpatch", mb::sepolpatch_main },
     { "sigverify", mb::sigverify_main },
     { "uevent_dump", mb::uevent_dump_main },
@@ -100,10 +103,11 @@ static void mbtool_usage(int error)
             "To see the usage and other help text for a tool, pass --help to\n"
             "the tool.\n\n"
             "Available tools:\n",
-            mb::get_mbtool_version(),
-            mb::get_git_version());
+            mb::version(),
+            mb::git_version());
     for (int i = 0; tools[i].name; ++i) {
-        if (strcmp(tools[i].name, "mbtool") != 0) {
+        if (strcmp(tools[i].name, "mbtool") != 0
+                && strcmp(tools[i].name, "mbtool_recovery") != 0) {
             fprintf(stream, "  %s\n", tools[i].name);
         }
     }

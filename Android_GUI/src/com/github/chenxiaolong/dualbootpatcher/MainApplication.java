@@ -21,6 +21,7 @@ import android.app.Application;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.support.v7.app.AppCompatDelegate;
+import android.util.Log;
 
 import com.squareup.leakcanary.LeakCanary;
 import com.squareup.leakcanary.RefWatcher;
@@ -28,6 +29,8 @@ import com.squareup.leakcanary.RefWatcher;
 import io.noobdev.neuteredsaf.DocumentsApplication;
 
 public class MainApplication extends Application {
+    private static final String TAG = MainApplication.class.getSimpleName();
+
     private RefWatcher mRefWatcher;
 
     public static RefWatcher getRefWatcher(Context context) {
@@ -38,10 +41,24 @@ public class MainApplication extends Application {
     @Override
     public void onCreate() {
         super.onCreate();
+
+        final Thread.UncaughtExceptionHandler defaultUEH =
+                Thread.getDefaultUncaughtExceptionHandler();
+
+        Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
+            @Override
+            public void uncaughtException(Thread thread, Throwable throwable) {
+                Log.e(TAG, thread + " has crashed with an uncaught exception; dumping log");
+                LogUtils.dump("crash.log");
+
+                if (defaultUEH != null) {
+                    defaultUEH.uncaughtException(thread, throwable);
+                }
+            }
+        });
+
         mRefWatcher = LeakCanary.install(this);
-        if (!FileUtils.useNativeSaf()) {
-            DocumentsApplication.install(this);
-        }
+        DocumentsApplication.install(this);
 
         SharedPreferences prefs = getSharedPreferences("settings", 0);
         boolean useDarkTheme = prefs.getBoolean("use_dark_theme", false);
@@ -52,9 +69,7 @@ public class MainApplication extends Application {
     @Override
     public void onTrimMemory(int level) {
         super.onTrimMemory(level);
-        if (!FileUtils.useNativeSaf()) {
-            DocumentsApplication.onTrimMemory(level);
-        }
+        DocumentsApplication.onTrimMemory(level);
     }
 
     public static boolean getUseDarkTheme() {

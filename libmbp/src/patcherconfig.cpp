@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2015  Andrew Gunnerson <andrewgunnerson@gmail.com>
+ * Copyright (C) 2015-2016  Andrew Gunnerson <andrewgunnerson@gmail.com>
  *
  * This file is part of MultiBootPatcher
  *
@@ -23,32 +23,16 @@
 
 #include <cassert>
 
-#include "mbp/device.h"
 #include "mbp/patcherinterface.h"
 #include "mbp/private/fileutils.h"
-#include "mbp/version.h"
-
-// Devices
-#include "devices/asus.h"
-#include "devices/google.h"
-#include "devices/huawei.h"
-#include "devices/lenovo.h"
-#include "devices/lg.h"
-#include "devices/motorola.h"
-#include "devices/nexus.h"
-#include "devices/oneplus.h"
-#include "devices/samsung.h"
-#include "devices/sony.h"
-#include "devices/xiaomi.h"
 
 // Patchers
 #include "mbp/autopatchers/standardpatcher.h"
-#include "mbp/autopatchers/xposedpatcher.h"
+#include "mbp/autopatchers/mountcmdpatcher.h"
 #include "mbp/patchers/mbtoolupdater.h"
 #include "mbp/patchers/multibootpatcher.h"
 #include "mbp/patchers/odinpatcher.h"
 #include "mbp/ramdiskpatchers/default.h"
-#include "mbp/ramdiskpatchers/pepper.h"
 
 
 namespace mbp
@@ -62,9 +46,6 @@ public:
     std::string dataDir;
     std::string tempDir;
 
-    std::string version;
-    std::vector<Device *> devices;
-
     // Errors
     ErrorCode error;
 
@@ -72,8 +53,6 @@ public:
     std::vector<Patcher *> allocPatchers;
     std::vector<AutoPatcher *> allocAutoPatchers;
     std::vector<RamdiskPatcher *> allocRamdiskPatchers;
-
-    void loadDefaultDevices();
 };
 /*! \endcond */
 
@@ -86,19 +65,10 @@ public:
 
 PatcherConfig::PatcherConfig() : m_impl(new Impl())
 {
-    m_impl->loadDefaultDevices();
-
-    m_impl->version = LIBMBP_VERSION;
 }
 
 PatcherConfig::~PatcherConfig()
 {
-    // Clean up devices
-    for (Device *device : m_impl->devices) {
-        delete device;
-    }
-    m_impl->devices.clear();
-
     for (Patcher *patcher : m_impl->allocPatchers) {
         destroyPatcher(patcher);
     }
@@ -178,41 +148,6 @@ void PatcherConfig::setTempDirectory(std::string path)
 }
 
 /*!
- * \brief Get version number of the patcher
- *
- * \return Version number
- */
-std::string PatcherConfig::version() const
-{
-    return m_impl->version;
-}
-
-/*!
- * \brief Get list of supported devices
- *
- * \return List of supported devices
- */
-std::vector<Device *> PatcherConfig::devices() const
-{
-    return m_impl->devices;
-}
-
-void PatcherConfig::Impl::loadDefaultDevices()
-{
-    addSamsungDevices(&devices);
-    addAsusDevices(&devices);
-    addGoogleDevices(&devices);
-    addHuaweiDevices(&devices);
-    addLenovoDevices(&devices);
-    addLgDevices(&devices);
-    addMotorolaDevices(&devices);
-    addNexusDevices(&devices);
-    addOnePlusDevices(&devices);
-    addSonyDevices(&devices);
-    addXiaomiDevices(&devices);
-}
-
-/*!
  * \brief Get list of Patcher IDs
  *
  * \return List of Patcher names
@@ -235,7 +170,7 @@ std::vector<std::string> PatcherConfig::autoPatchers() const
 {
     return {
         StandardPatcher::Id,
-        XposedPatcher::Id
+        MountCmdPatcher::Id
     };
 }
 
@@ -248,7 +183,6 @@ std::vector<std::string> PatcherConfig::ramdiskPatchers() const
 {
     return {
         DefaultRP::Id,
-        PepperDefaultRP::Id,
     };
 }
 
@@ -293,8 +227,8 @@ AutoPatcher * PatcherConfig::createAutoPatcher(const std::string &id,
 
     if (id == StandardPatcher::Id) {
         ap = new StandardPatcher(this, info);
-    } else if (id == XposedPatcher::Id) {
-        ap = new XposedPatcher(this, info);
+    } else if (id == MountCmdPatcher::Id) {
+        ap = new MountCmdPatcher(this, info);
     }
 
     if (ap != nullptr) {
@@ -321,8 +255,6 @@ RamdiskPatcher * PatcherConfig::createRamdiskPatcher(const std::string &id,
 
     if (id == DefaultRP::Id) {
         rp = new DefaultRP(this, info, cpio);
-    } else if (id == PepperDefaultRP::Id) {
-        rp = new PepperDefaultRP(this, info, cpio);
     }
 
     if (rp != nullptr) {

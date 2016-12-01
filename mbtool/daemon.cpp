@@ -23,6 +23,7 @@
 
 #include <fcntl.h>
 #include <getopt.h>
+#include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -31,22 +32,23 @@
 
 #include <proc/readproc.h>
 
+#include "mbcommon/version.h"
 #include "mblog/logging.h"
+#include "mblog/kmsg_logger.h"
 #include "mblog/stdio_logger.h"
 #include "mbutil/autoclose/file.h"
 #include "mbutil/directory.h"
 #include "mbutil/finally.h"
 #include "mbutil/process.h"
-#include "mbutil/properties.h"
 #include "mbutil/selinux.h"
 #include "mbutil/socket.h"
 
 #include "daemon_v3.h"
 #include "multiboot.h"
 #include "packages.h"
+#include "roms.h"
 #include "sepolpatch.h"
 #include "validcerts.h"
-#include "version.h"
 
 #define RESPONSE_ALLOW "ALLOW"                  // Credentials allowed
 #define RESPONSE_DENY "DENY"                    // Credentials denied
@@ -59,6 +61,11 @@ namespace mb
 
 static int pipe_fds[2];
 static bool send_ok_to_pipe = false;
+static bool sigstop_when_ready = false;
+static bool allow_root_client = false;
+static bool log_to_kmsg = false;
+static bool log_to_stdio = false;
+static bool no_unshare = false;
 
 static autoclose::file log_fp(nullptr, std::fclose);
 
@@ -126,7 +133,14 @@ static bool client_connection(int fd)
         LOGD("Disconnecting connection from PID: %u", cred.pid);
     });
 
-    if (verify_credentials(cred.uid)) {
+    if (allow_root_client && cred.uid == 0 && cred.gid == 0) {
+        LOGV("Received connection from client with root UID and GID");
+        LOGW("WARNING: Cannot verify signature of root client process");
+        if (!util::socket_write_string(fd, RESPONSE_ALLOW)) {
+            LOGE("Failed to send credentials allowed message");
+            return false;
+        }
+    } else if (verify_credentials(cred.uid)) {
         if (!util::socket_write_string(fd, RESPONSE_ALLOW)) {
             LOGE("Failed to send credentials allowed message");
             return false;
@@ -164,7 +178,7 @@ static bool client_connection(int fd)
     return true;
 }
 
-static bool run_daemon(void)
+static bool run_daemon()
 {
     int fd;
     struct sockaddr_un addr;
@@ -209,6 +223,8 @@ static bool run_daemon(void)
             LOGE("Failed to send OK to parent process");
             return false;
         }
+    } else if (sigstop_when_ready) {
+        kill(getpid(), SIGSTOP);
     }
 
     // Eat zombies!
@@ -230,9 +246,17 @@ static bool run_daemon(void)
         if (child_pid < 0) {
             LOGE("Failed to fork: %s", strerror(errno));
         } else if (child_pid == 0) {
-            if (unshare(CLONE_NEWNS) < 0) {
-                LOGE("unshare() failed: %s", strerror(errno));
-                _exit(127);
+            if (!no_unshare) {
+                if (unshare(CLONE_NEWNS) < 0) {
+                    LOGE("unshare() failed: %s", strerror(errno));
+                    _exit(127);
+                }
+
+                if (mount("", "/", "", MS_PRIVATE | MS_REC, "") < 0) {
+                    LOGE("Failed to set private mount propagation: %s",
+                         strerror(errno));
+                    _exit(127);
+                }
             }
 
             // Change the process name so --replace doesn't kill existing
@@ -309,28 +333,37 @@ static bool daemon_init()
 
     umask(0);
 
-    if (!redirect_stdio_to_dev_null()) {
+    if (!log_to_stdio && !redirect_stdio_to_dev_null()) {
         return false;
     }
 
     // Set up logging
-    if (!util::mkdir_parent(MULTIBOOT_LOG_DAEMON, 0775) && errno != EEXIST) {
-        LOGE("Failed to create parent directory of %s: %s",
-             MULTIBOOT_LOG_DAEMON, strerror(errno));
-        return false;
+    if (log_to_stdio) {
+        // Default; do nothing
+    } else if (log_to_kmsg) {
+        log::log_set_logger(std::make_shared<log::KmsgLogger>(false));
+    } else {
+        if (!util::mkdir_parent(MULTIBOOT_LOG_DAEMON, 0775)
+                && errno != EEXIST) {
+            LOGE("Failed to create parent directory of %s: %s",
+                 MULTIBOOT_LOG_DAEMON, strerror(errno));
+            return false;
+        }
+
+        log_fp = autoclose::fopen(
+                get_raw_path(MULTIBOOT_LOG_DAEMON).c_str(), "w");
+        if (!log_fp) {
+            LOGE("Failed to open log file %s: %s",
+                 MULTIBOOT_LOG_DAEMON, strerror(errno));
+            return false;
+        }
+
+        fix_multiboot_permissions();
+
+        // mbtool logging
+        log::log_set_logger(
+                std::make_shared<log::StdioLogger>(log_fp.get(), true));
     }
-
-    log_fp = autoclose::fopen(MULTIBOOT_LOG_DAEMON, "w");
-    if (!log_fp) {
-        LOGE("Failed to open log file %s: %s",
-             MULTIBOOT_LOG_DAEMON, strerror(errno));
-        return false;
-    }
-
-    fix_multiboot_permissions();
-
-    // mbtool logging
-    log::log_set_logger(std::make_shared<log::StdioLogger>(log_fp.get(), true));
 
     LOGD("Initialized daemon");
 
@@ -338,7 +371,7 @@ static bool daemon_init()
 }
 
 __attribute__((noreturn))
-static void run_daemon_fork(void)
+static void run_daemon_fork()
 {
     pid_t pid = fork();
     if (pid < 0) {
@@ -404,38 +437,8 @@ static void run_daemon_fork(void)
     // Close read end of the pipe
     close(pipe_fds[0]);
 
-    _exit((daemon_init() && run_daemon()) ? EXIT_SUCCESS : EXIT_FAILURE);
-}
-
-static bool patch_sepolicy_daemon()
-{
-    policydb_t pdb;
-
-    if (policydb_init(&pdb) < 0) {
-        LOGE("Failed to initialize policydb");
-        return false;
-    }
-
-    if (!util::selinux_read_policy(SELINUX_POLICY_FILE, &pdb)) {
-        LOGE("Failed to read SELinux policy file: %s", SELINUX_POLICY_FILE);
-        policydb_destroy(&pdb);
-        return false;
-    }
-
-    LOGD("Policy version: %u", pdb.policyvers);
-
-    util::selinux_add_rule(&pdb, "untrusted_app", "init",
-                           "unix_stream_socket", "connectto");
-
-    if (!util::selinux_write_policy(SELINUX_LOAD_FILE, &pdb)) {
-        LOGE("Failed to write SELinux policy file: %s", SELINUX_LOAD_FILE);
-        policydb_destroy(&pdb);
-        return false;
-    }
-
-    policydb_destroy(&pdb);
-
-    return true;
+    _exit((daemon_init() && run_daemon())
+            ? EXIT_SUCCESS : EXIT_FAILURE);
 }
 
 static void daemon_usage(bool error)
@@ -447,24 +450,46 @@ static void daemon_usage(bool error)
             "Options:\n"
             "  -d, --daemonize  Fork to background\n"
             "  -r, --replace    Kill existing daemon (if any) before starting\n"
-            "  -h, --help       Display this help message\n");
+            "  -h, --help       Display this help message\n"
+            "  --allow-root-client\n"
+            "                   Allow clients with root UID and GID to connect\n"
+            "                   without signature verification\n"
+            "  --no-patch-sepolicy\n"
+            "                   Skip procedures for modifying the SELinux policy\n"
+            "  --sigstop-when-ready\n"
+            "                   Send SIGSTOP to daemon process when it has been\n"
+            "                   fully initialized\n"
+            "  --log-to-kmsg    Send log output to kernel log instead of file\n"
+            "  --log-to-stdio   Send log output to stdout/stderr\n"
+            "  --no-unshare     Don't unshare mount namespace\n");
 }
 
 int daemon_main(int argc, char *argv[])
 {
-    if (unshare(CLONE_NEWNS) < 0) {
-        fprintf(stderr, "unshare() failed: %s\n", strerror(errno));
-        return EXIT_FAILURE;
-    }
-
     int opt;
     bool fork_flag = false;
     bool replace_flag = false;
+    bool patch_sepolicy = true;
+
+    enum {
+        OPT_ALLOW_ROOT_CLIENT = 1000,
+        OPT_NO_PATCH_SEPOLICY = 1001,
+        OPT_SIGSTOP_WHEN_READY = 1002,
+        OPT_LOG_TO_KMSG = 1003,
+        OPT_LOG_TO_STDIO = 1004,
+        OPT_NO_UNSHARE = 1005,
+    };
 
     static struct option long_options[] = {
-        {"daemonize", no_argument, 0, 'd'},
-        {"replace",   no_argument, 0, 'r'},
-        {"help",      no_argument, 0, 'h'},
+        {"daemonize",          no_argument, 0, 'd'},
+        {"replace",            no_argument, 0, 'r'},
+        {"help",               no_argument, 0, 'h'},
+        {"allow-root-client",  no_argument, 0, OPT_ALLOW_ROOT_CLIENT},
+        {"no-patch-sepolicy",  no_argument, 0, OPT_NO_PATCH_SEPOLICY},
+        {"sigstop-when-ready", no_argument, 0, OPT_SIGSTOP_WHEN_READY},
+        {"log-to-kmsg",        no_argument, 0, OPT_LOG_TO_KMSG},
+        {"log-to-stdio",       no_argument, 0, OPT_LOG_TO_STDIO},
+        {"no-unshare",         no_argument, 0, OPT_NO_UNSHARE},
         {0, 0, 0, 0}
     };
 
@@ -484,6 +509,30 @@ int daemon_main(int argc, char *argv[])
             daemon_usage(0);
             return EXIT_SUCCESS;
 
+        case OPT_ALLOW_ROOT_CLIENT:
+            allow_root_client = true;
+            break;
+
+        case OPT_NO_PATCH_SEPOLICY:
+            patch_sepolicy = false;
+            break;
+
+        case OPT_SIGSTOP_WHEN_READY:
+            sigstop_when_ready = true;
+            break;
+
+        case OPT_LOG_TO_KMSG:
+            log_to_kmsg = true;
+            break;
+
+        case OPT_LOG_TO_STDIO:
+            log_to_stdio = true;
+            break;
+
+        case OPT_NO_UNSHARE:
+            no_unshare = true;
+            break;
+
         default:
             daemon_usage(1);
             return EXIT_FAILURE;
@@ -496,21 +545,18 @@ int daemon_main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    // Patch SELinux policy to make init permissive
-    patch_loaded_sepolicy();
+    if (!no_unshare && unshare(CLONE_NEWNS) < 0) {
+        fprintf(stderr, "unshare() failed: %s\n", strerror(errno));
+        return EXIT_FAILURE;
+    }
 
-    // Allow untrusted_app to connect to our daemon
-    patch_sepolicy_daemon();
+    if (patch_sepolicy) {
+        patch_loaded_sepolicy(SELinuxPatch::MAIN);
+    }
 
-    // Set version property if we're the system mbtool (i.e. launched by init)
-    // Possible to override this with another program by double forking, letting
-    // 2nd child reparent to init, and then calling execve("/mbtool", ...), but
-    // meh ...
-    if (getppid() == 1) {
-        if (!util::set_property("ro.multiboot.version", get_mbtool_version())) {
-            LOGW("Failed to set 'ro.multiboot.version' to '%s'\n",
-                 get_mbtool_version());
-        }
+    if (!switch_context(MB_EXEC_CONTEXT)) {
+        fprintf(stderr, "Failed to switch context; %s may not run properly",
+                argv[0]);
     }
 
     if (replace_flag) {
@@ -537,7 +583,7 @@ int daemon_main(int argc, char *argv[])
                             && strstr(info->cmdline[1], "daemon") // And it's a daemon process
                             && info->tid != curpid) {             // And we're not killing ourself
                         // Kill the daemon process
-                        LOGV("Killing PID %d\n", info->tid);
+                        LOGV("Killing PID %d", info->tid);
                         kill(info->tid, SIGTERM);
                     }
                 }
@@ -555,7 +601,8 @@ int daemon_main(int argc, char *argv[])
     if (fork_flag) {
         run_daemon_fork();
     } else {
-        return (daemon_init() && run_daemon()) ? EXIT_SUCCESS : EXIT_FAILURE;
+        return (daemon_init() && run_daemon())
+                ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 }
 

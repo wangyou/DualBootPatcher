@@ -19,6 +19,8 @@
 
 #include "roms.h"
 
+#include <algorithm>
+
 #include <cstdlib>
 #include <cstring>
 #include <dirent.h>
@@ -40,6 +42,7 @@ static std::vector<std::string> extsd_mount_points{
     "/raw/extsd",
     "/external_sd",
     "/external_sdcard",
+    "/microSD",
     "/extSdCard",
     "/storage/sdcard1",
     "/storage/extSdCard",
@@ -79,17 +82,20 @@ std::string Rom::full_data_path()
 
 std::string Rom::boot_image_path()
 {
-    return util::format(MULTIBOOT_DIR "/%s/boot.img", id.c_str());
+    return get_raw_path(util::format(
+            MULTIBOOT_DIR "/%s/boot.img", id.c_str()));
 }
 
 std::string Rom::config_path()
 {
-    return util::format(MULTIBOOT_DIR "/%s/config.json", id.c_str());
+    return get_raw_path(util::format(
+            MULTIBOOT_DIR "/%s/config.json", id.c_str()));
 }
 
 std::string Rom::thumbnail_path()
 {
-    return util::format(MULTIBOOT_DIR "/%s/thumbnail.webp", id.c_str());
+    return get_raw_path(util::format(
+            MULTIBOOT_DIR "/%s/thumbnail.webp", id.c_str()));
 }
 
 std::shared_ptr<Rom> Roms::create_rom_primary()
@@ -181,6 +187,12 @@ void Roms::add_builtin()
     }
 }
 
+static bool cmp_rom_id(const std::shared_ptr<Rom> &a,
+                       const std::shared_ptr<Rom> &b)
+{
+    return a->id < b->id;
+}
+
 void Roms::add_data_roms()
 {
     std::string system = get_raw_path("/data/multiboot");
@@ -196,6 +208,8 @@ void Roms::add_data_roms()
 
     struct stat sb;
 
+    std::vector<std::shared_ptr<Rom>> temp_roms;
+
     struct dirent *ent;
     while ((ent = readdir(dp))) {
         if (strcmp(ent->d_name, "data-slot-") == 0
@@ -208,20 +222,29 @@ void Roms::add_data_roms()
         fullpath += ent->d_name;
 
         if (stat(fullpath.c_str(), &sb) == 0 && S_ISDIR(sb.st_mode)) {
-            roms.push_back(create_rom_data_slot(ent->d_name + 10));
+            temp_roms.push_back(create_rom_data_slot(ent->d_name + 10));
         }
     }
+
+    // Sort by ID
+    std::sort(temp_roms.begin(), temp_roms.end(), &cmp_rom_id);
+    std::move(temp_roms.begin(), temp_roms.end(), std::back_inserter(roms));
 }
 
 void Roms::add_extsd_roms()
 {
     std::string mount_point = get_extsd_partition();
-    if (mount_point.empty()) {
-        return;
-    }
+    std::string search_dir;
+    bool is_boot;
 
-    std::string search_dir(mount_point);
-    search_dir += "/multiboot";
+    if (mount_point.empty()) {
+        search_dir = get_raw_path(MULTIBOOT_DIR);
+        is_boot = true;
+    } else {
+        search_dir = mount_point;
+        search_dir += "/multiboot";
+        is_boot = false;
+    }
 
     DIR *dp = opendir(search_dir.c_str());
     if (!dp) {
@@ -234,6 +257,8 @@ void Roms::add_extsd_roms()
 
     struct stat sb;
 
+    std::vector<std::shared_ptr<Rom>> temp_roms;
+
     struct dirent *ent;
     while ((ent = readdir(dp))) {
         if (strcmp(ent->d_name, "extsd-slot-") == 0
@@ -244,12 +269,19 @@ void Roms::add_extsd_roms()
         std::string image(search_dir);
         image += "/";
         image += ent->d_name;
-        image += "/system.img";
+        if (is_boot) {
+            image += "/boot.img";
+        } else {
+            image += "/system.img";
+        }
 
         if (stat(image.c_str(), &sb) == 0 && S_ISREG(sb.st_mode)) {
-            roms.push_back(create_rom_extsd_slot(ent->d_name + 11));
+            temp_roms.push_back(create_rom_extsd_slot(ent->d_name + 11));
         }
     }
+
+    std::sort(temp_roms.begin(), temp_roms.end(), &cmp_rom_id);
+    std::move(temp_roms.begin(), temp_roms.end(), std::back_inserter(roms));
 }
 
 void Roms::add_installed()
@@ -262,9 +294,13 @@ void Roms::add_installed()
     struct stat sb;
 
     for (auto rom : all_roms.roms) {
+        std::string boot_path = get_raw_path(rom->boot_image_path());
         std::string system_path = rom->full_system_path();
 
-        if (rom->system_is_image) {
+        if (stat(boot_path.c_str(), &sb) == 0) {
+            // If boot image exists, assume that the ROM is installed
+            roms.push_back(rom);
+        } else if (rom->system_is_image) {
             // If /system is on an ext4 image, check if the image exists
             if (stat(system_path.c_str(), &sb) == 0 && S_ISREG(sb.st_mode)) {
                 roms.push_back(rom);
@@ -298,10 +334,18 @@ std::shared_ptr<Rom> Roms::get_current_rom()
     roms.add_installed();
 
     // This is set if mbtool is handling the boot process
-    std::string prop_id;
-    util::get_property("ro.multiboot.romid", &prop_id, std::string());
+    char prop_id[PROP_VALUE_MAX];
+    util::property_get(PROP_MULTIBOOT_ROM_ID, prop_id, "");
+    // This is necessary for the daemon to get a correct result before Android
+    // boots (eg. for the boot UI)
+    if (!prop_id[0]) {
+        std::string temp;
+        util::file_get_property(DEFAULT_PROP_PATH, PROP_MULTIBOOT_ROM_ID,
+                                &temp, std::string());
+        strlcpy(prop_id, temp.c_str(), sizeof(prop_id));
+    }
 
-    if (!prop_id.empty()) {
+    if (prop_id[0]) {
         auto rom = roms.find_by_id(prop_id);
         if (rom) {
             return rom;
@@ -315,7 +359,7 @@ std::shared_ptr<Rom> Roms::get_current_rom()
     bool has_raw_system = stat("/raw-system", &sb) == 0;
     if (!has_raw && !has_raw_system) {
         // Cache the result
-        util::set_property("ro.multiboot.romid", "primary");
+        util::property_set(PROP_MULTIBOOT_ROM_ID, "primary");
 
         return roms.find_by_id("primary");
     }
@@ -341,7 +385,7 @@ std::shared_ptr<Rom> Roms::get_current_rom()
                     && sb.st_dev == sb2.st_dev
                     && sb.st_ino == sb2.st_ino) {
                 // Cache the result
-                util::set_property("ro.multiboot.romid", rom->id);
+                util::property_set(PROP_MULTIBOOT_ROM_ID, rom->id.c_str());
 
                 return rom;
             }
@@ -489,17 +533,23 @@ std::string Roms::get_mountpoint(Rom::Source source)
 //       get_system_partition(), get_cache_partition(), and get_data_partition()
 std::string get_raw_path(const std::string &path)
 {
-    struct stat sb;
-    if (stat("/raw", &sb) == 0 && S_ISDIR(sb.st_mode)) {
-        std::string result("/raw");
-        if (!path.empty() && path[0] != '/') {
-            result += "/";
-        }
-        result += path;
-        return result;
+    std::string result;
+
+    // This is faster than doing util::path_split()...
+    if (path == "/system" || util::starts_with(path, "/system/")) {
+        result = Roms::get_system_partition();
+        result += path.substr(7);
+    } else if (path == "/cache" || util::starts_with(path, "/cache/")) {
+        result = Roms::get_cache_partition();
+        result += path.substr(6);
+    } else if (path == "/data" || util::starts_with(path, "/data/")) {
+        result = Roms::get_data_partition();
+        result += path.substr(5);
     } else {
-        return path;
+        result = path;
     }
+
+    return result;
 }
 
 }

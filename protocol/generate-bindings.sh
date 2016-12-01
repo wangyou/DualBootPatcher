@@ -3,6 +3,8 @@
 cd "$(dirname "${0}")"
 
 files=(
+    v3/crypto_decrypt.fbs
+    v3/crypto_get_pw_type.fbs
     v3/file_chmod.fbs
     v3/file_close.fbs
     v3/file_open.fbs
@@ -14,6 +16,8 @@ files=(
     v3/file_selinux_set_label.fbs
     v3/path_chmod.fbs
     v3/path_copy.fbs
+    v3/path_delete.fbs
+    v3/path_mkdir.fbs
     v3/path_selinux_get_label.fbs
     v3/path_selinux_set_label.fbs
     v3/path_get_directory_size.fbs
@@ -26,6 +30,7 @@ files=(
     v3/mb_wipe_rom.fbs
     v3/mb_get_packages_count.fbs
     v3/reboot.fbs
+    v3/shutdown.fbs
     request.fbs
     response.fbs
 )

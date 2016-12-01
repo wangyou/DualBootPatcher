@@ -35,16 +35,6 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/external/linux-api-headers)
 #   cd /tmp/
 set(DEBUGGING FALSE)
 
-# Generate version.cpp
-include("${CMAKE_SOURCE_DIR}/cmake/external/GetGitRevisionDescription.cmake")
-git_describe(GIT_VERSION --dirty --always --tags)
-
-configure_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/version.cpp.in
-    ${CMAKE_CURRENT_BINARY_DIR}/gen/version.cpp
-    @ONLY
-)
-
 # Generate validcerts.cpp
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/validcerts.cpp.in
@@ -68,8 +58,11 @@ set(MINIADBD_SOURCES
 set(MBTOOL_BASE_SOURCES
     appsync.cpp
     appsyncmanager.cpp
+    auditd.cpp
     daemon.cpp
     daemon_v3.cpp
+    decrypt.cpp
+    emergency.cpp
     init.cpp
     main.cpp
     miniadbd.cpp
@@ -84,13 +77,13 @@ set(MBTOOL_BASE_SOURCES
     switcher.cpp
     uevent_dump.cpp
     wipe.cpp
-    external/android_reboot.c
     external/legacy_property_service.cpp
+    external/audit/libaudit.cpp
+    external/property_service.cpp
     initwrapper/cutils/uevent.cpp
     initwrapper/devices.cpp
     initwrapper/util.cpp
     ${CMAKE_CURRENT_BINARY_DIR}/gen/validcerts.cpp
-    ${CMAKE_CURRENT_BINARY_DIR}/gen/version.cpp
     ${CMAKE_SOURCE_DIR}/external/pugixml/src/pugixml.cpp
 )
 
@@ -102,6 +95,15 @@ set(MBTOOL_RECOVERY_SOURCES
     update_binary.cpp
     update_binary_tool.cpp
     utilities.cpp
+)
+
+set_source_files_properties(
+    miniadbd.cpp
+    external/audit/libaudit.h
+    external/audit/libaudit.cpp
+    external/property_service.cpp
+    PROPERTIES
+    COMPILE_FLAGS "-Wno-gnu-statement-expression -Wno-zero-length-array"
 )
 
 if(${MBP_BUILD_TARGET} STREQUAL android-system)
@@ -141,10 +143,11 @@ if(${MBP_BUILD_TARGET} STREQUAL android-system)
     )
 
     # Ugly, but I don't want to deviate too much from upstream to fix it
-    set_target_properties(
+    target_compile_options(
         miniadbd-static
-        PROPERTIES
-        COMPILE_FLAGS "-Wno-missing-field-initializers -Wno-pedantic -Wno-unused-parameter"
+        PRIVATE
+        -Wno-missing-field-initializers -Wno-pedantic -Wno-unused-parameter
+        -Wno-gnu-statement-expression
     )
 
     set_target_properties(
@@ -173,6 +176,7 @@ if(${MBP_BUILD_TARGET} STREQUAL android-system)
             mbtool mbtool_recovery
             PROPERTIES
             LINK_FLAGS "-static"
+            LINK_SEARCH_START_STATIC ON
         )
     endif()
 
@@ -181,9 +185,13 @@ if(${MBP_BUILD_TARGET} STREQUAL android-system)
         miniadbd-static
         mbutil-static
         mbsign-static
+        mbdevice-static
         mblog-static
+        mbcommon-static
+        minizip
         ${MBP_JANSSON_LIBRARIES}
         ${MBP_PROCPS_NG_LIBRARIES}
+        ${MBP_ZLIB_LIBRARIES}
     )
     target_link_libraries(
         mbtool_recovery
@@ -193,6 +201,8 @@ if(${MBP_BUILD_TARGET} STREQUAL android-system)
         mblog-static
         mbp-static
         mbpio-static
+        mbdevice-static
+        mbcommon-static
         minizip
         ${MBP_JANSSON_LIBRARIES}
         ${MBP_LIBARCHIVE_LIBRARIES}

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2014-2015  Andrew Gunnerson <andrewgunnerson@gmail.com>
+ * Copyright (C) 2014-2016  Andrew Gunnerson <andrewgunnerson@gmail.com>
  *
  * This file is part of MultiBootPatcher
  *
@@ -28,9 +28,12 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "mbcommon/version.h"
 #include "mblog/logging.h"
 #include "mbutil/command.h"
 #include "mbutil/copy.h"
+#include "mbutil/delete.h"
+#include "mbutil/directory.h"
 #include "mbutil/finally.h"
 #include "mbutil/fts.h"
 #include "mbutil/properties.h"
@@ -38,15 +41,18 @@
 #include "mbutil/socket.h"
 #include "mbutil/string.h"
 
+#include "decrypt.h"
+#include "init.h"
 #include "packages.h"
 #include "reboot.h"
 #include "roms.h"
 #include "signature.h"
 #include "switcher.h"
-#include "version.h"
 #include "wipe.h"
 
 // flatbuffers
+#include "protocol/crypto_decrypt_generated.h"
+#include "protocol/crypto_get_pw_type_generated.h"
 #include "protocol/file_chmod_generated.h"
 #include "protocol/file_close_generated.h"
 #include "protocol/file_open_generated.h"
@@ -58,6 +64,8 @@
 #include "protocol/file_write_generated.h"
 #include "protocol/path_chmod_generated.h"
 #include "protocol/path_copy_generated.h"
+#include "protocol/path_delete_generated.h"
+#include "protocol/path_mkdir_generated.h"
 #include "protocol/path_selinux_get_label_generated.h"
 #include "protocol/path_selinux_set_label_generated.h"
 #include "protocol/path_get_directory_size_generated.h"
@@ -69,6 +77,7 @@
 #include "protocol/mb_wipe_rom_generated.h"
 #include "protocol/mb_get_packages_count_generated.h"
 #include "protocol/reboot_generated.h"
+#include "protocol/shutdown_generated.h"
 #include "protocol/request_generated.h"
 #include "protocol/response_generated.h"
 
@@ -102,6 +111,61 @@ static bool v3_send_response_unsupported(int fd)
     auto response = v3::CreateResponse(builder, v3::ResponseType_Unsupported,
                                        v3::CreateUnsupported(builder).Union());
     builder.Finish(response);
+    return v3_send_response(fd, builder);
+}
+
+static bool v3_crypto_decrypt(int fd, const v3::Request *msg)
+{
+    auto request = (v3::CryptoDecryptRequest *) msg->request();
+    if (!request->password()) {
+        return v3_send_response_invalid(fd);
+    }
+
+    fb::FlatBufferBuilder builder;
+    fb::Offset<v3::CryptoDecryptResponse> response;
+
+    std::string block_dev = decrypt_userdata(request->password()->c_str());
+    bool ret = !block_dev.empty() && mount_userdata(block_dev.c_str());
+
+    response = v3::CreateCryptoDecryptResponse(builder, ret);
+
+    // Wrap response
+    v3::ResponseBuilder rb(builder);
+    rb.add_response_type(v3::ResponseType_CryptoDecryptResponse);
+    rb.add_response(response.Union());
+    builder.Finish(rb.Finish());
+
+    return v3_send_response(fd, builder);
+}
+
+static bool v3_crypto_get_pw_type(int fd, const v3::Request *msg)
+{
+    (void) msg;
+
+    fb::FlatBufferBuilder builder;
+    fb::Offset<v3::CryptoGetPwTypeResponse> response;
+
+    v3::CryptoPwType v3_pw_type = v3::CryptoPwType_UNKNOWN;
+
+    std::string pw_type = decrypt_get_pw_type();
+    if (pw_type == CRYPTFS_PW_TYPE_DEFAULT) {
+        v3_pw_type = v3::CryptoPwType_DEFAULT;
+    } else if (pw_type == CRYPTFS_PW_TYPE_PASSWORD) {
+        v3_pw_type = v3::CryptoPwType_PASSWORD;
+    } else if (pw_type == CRYPTFS_PW_TYPE_PATTERN) {
+        v3_pw_type = v3::CryptoPwType_PATTERN;
+    } else if (pw_type == CRYPTFS_PW_TYPE_PIN) {
+        v3_pw_type = v3::CryptoPwType_PIN;
+    }
+
+    response = v3::CreateCryptoGetPwTypeResponse(builder, v3_pw_type);
+
+    // Wrap response
+    v3::ResponseBuilder rb(builder);
+    rb.add_response_type(v3::ResponseType_CryptoGetPwTypeResponse);
+    rb.add_response(response.Union());
+    builder.Finish(rb.Finish());
+
     return v3_send_response(fd, builder);
 }
 
@@ -143,13 +207,14 @@ static bool v3_file_chmod(int fd, const v3::Request *msg)
 static bool v3_file_close(int fd, const v3::Request *msg)
 {
     auto request = (v3::FileCloseRequest *) msg->request();
-    if (fd_map.find(request->id()) == fd_map.end()) {
+    auto it = fd_map.find(request->id());
+    if (it == fd_map.end()) {
         return v3_send_response_invalid(fd);
     }
 
     // Remove ID from map
-    int ffd = fd_map[request->id()];
-    fd_map.erase(request->id());
+    int ffd = it->second;
+    fd_map.erase(it);
 
     fb::FlatBufferBuilder builder;
     fb::Offset<v3::FileCloseResponse> response;
@@ -225,11 +290,12 @@ static bool v3_file_open(int fd, const v3::Request *msg)
 static bool v3_file_read(int fd, const v3::Request *msg)
 {
     auto request = (v3::FileReadRequest *) msg->request();
-    if (fd_map.find(request->id()) == fd_map.end()) {
+    auto it = fd_map.find(request->id());
+    if (it == fd_map.end()) {
         return v3_send_response_invalid(fd);
     }
 
-    int ffd = fd_map[request->id()];
+    int ffd = it->second;
 
     std::vector<unsigned char> buf(request->count());
 
@@ -257,11 +323,12 @@ static bool v3_file_read(int fd, const v3::Request *msg)
 static bool v3_file_seek(int fd, const v3::Request *msg)
 {
     auto request = (v3::FileSeekRequest *) msg->request();
-    if (fd_map.find(request->id()) == fd_map.end()) {
+    auto it = fd_map.find(request->id());
+    if (it == fd_map.end()) {
         return v3_send_response_invalid(fd);
     }
 
-    int ffd = fd_map[request->id()];
+    int ffd = it->second;
     int64_t offset = request->offset();
     int whence;
 
@@ -300,11 +367,12 @@ static bool v3_file_seek(int fd, const v3::Request *msg)
 static bool v3_file_selinux_get_label(int fd, const v3::Request *msg)
 {
     auto request = (v3::FileSELinuxGetLabelRequest *) msg->request();
-    if (fd_map.find(request->id()) == fd_map.end()) {
+    auto it = fd_map.find(request->id());
+    if (it == fd_map.end()) {
         return v3_send_response_invalid(fd);
     }
 
-    int ffd = fd_map[request->id()];
+    int ffd = it->second;
 
     fb::FlatBufferBuilder builder;
     fb::Offset<v3::FileSELinuxGetLabelResponse> response;
@@ -333,11 +401,12 @@ static bool v3_file_selinux_get_label(int fd, const v3::Request *msg)
 static bool v3_file_selinux_set_label(int fd, const v3::Request *msg)
 {
     auto request = (v3::FileSELinuxSetLabelRequest *) msg->request();
-    if (fd_map.find(request->id()) == fd_map.end() || !request->label()) {
+    auto it = fd_map.find(request->id());
+    if (it == fd_map.end() || !request->label()) {
         return v3_send_response_invalid(fd);
     }
 
-    int ffd = fd_map[request->id()];
+    int ffd = it->second;
 
     fb::FlatBufferBuilder builder;
     fb::Offset<v3::FileSELinuxSetLabelResponse> response;
@@ -361,11 +430,12 @@ static bool v3_file_selinux_set_label(int fd, const v3::Request *msg)
 static bool v3_file_stat(int fd, const v3::Request *msg)
 {
     auto request = (v3::FileStatRequest *) msg->request();
-    if (fd_map.find(request->id()) == fd_map.end()) {
+    auto it = fd_map.find(request->id());
+    if (it == fd_map.end()) {
         return v3_send_response_invalid(fd);
     }
 
-    int ffd = fd_map[request->id()];
+    int ffd = it->second;
 
     fb::FlatBufferBuilder builder;
     fb::Offset<v3::FileStatResponse> response;
@@ -407,11 +477,12 @@ static bool v3_file_stat(int fd, const v3::Request *msg)
 static bool v3_file_write(int fd, const v3::Request *msg)
 {
     auto request = (v3::FileWriteRequest *) msg->request();
-    if (fd_map.find(request->id()) == fd_map.end() || !request->data()) {
+    auto it = fd_map.find(request->id());
+    if (it == fd_map.end() || !request->data()) {
         return v3_send_response_invalid(fd);
     }
 
-    int ffd = fd_map[request->id()];
+    int ffd = it->second;
 
     fb::FlatBufferBuilder builder;
     fb::Offset<v3::FileWriteResponse> response;
@@ -487,6 +558,96 @@ static bool v3_path_copy(int fd, const v3::Request *msg)
     // Wrap response
     v3::ResponseBuilder rb(builder);
     rb.add_response_type(v3::ResponseType_PathCopyResponse);
+    rb.add_response(response.Union());
+    builder.Finish(rb.Finish());
+
+    return v3_send_response(fd, builder);
+}
+
+static bool v3_path_delete(int fd, const v3::Request *msg)
+{
+    auto request = (v3::PathDeleteRequest *) msg->request();
+    if (!request->path()) {
+        return v3_send_response_invalid(fd);
+    }
+
+    bool ret;
+    int saved_errno;
+
+    switch (request->flag()) {
+    case v3::PathDeleteFlag_REMOVE:
+        ret = remove(request->path()->c_str()) == 0;
+        saved_errno = errno;
+        break;
+    case v3::PathDeleteFlag_UNLINK:
+        ret = unlink(request->path()->c_str()) == 0;
+        saved_errno = errno;
+        break;
+    case v3::PathDeleteFlag_RMDIR:
+        ret = unlink(request->path()->c_str()) == 0;
+        saved_errno = errno;
+        break;
+    case v3::PathDeleteFlag_RECURSIVE:
+        ret = util::delete_recursive(request->path()->c_str());
+        saved_errno = errno;
+        break;
+    default:
+        return v3_send_response_invalid(fd);
+    }
+
+    fb::FlatBufferBuilder builder;
+    fb::Offset<v3::PathDeleteResponse> response;
+
+    if (ret) {
+        response = v3::CreatePathDeleteResponse(builder, true);
+    } else {
+        auto error = builder.CreateString(strerror(saved_errno));
+        response = v3::CreatePathDeleteResponse(builder, false, error);
+    }
+
+    // Wrap response
+    v3::ResponseBuilder rb(builder);
+    rb.add_response_type(v3::ResponseType_PathDeleteResponse);
+    rb.add_response(response.Union());
+    builder.Finish(rb.Finish());
+
+    return v3_send_response(fd, builder);
+}
+
+static bool v3_path_mkdir(int fd, const v3::Request *msg)
+{
+    auto request = (v3::PathMkdirRequest *) msg->request();
+    if (!request->path()) {
+        return v3_send_response_invalid(fd);
+    }
+
+    // Don't allow setting setuid or setgid permissions
+    uint32_t mode = request->mode();
+    uint32_t masked = mode & (S_IRWXU | S_IRWXG | S_IRWXO);
+    if (masked != mode) {
+        return v3_send_response_invalid(fd);
+    }
+
+    fb::FlatBufferBuilder builder;
+    fb::Offset<v3::PathMkdirResponse> response;
+
+    bool ret;
+    if (request->recursive()) {
+        ret = util::mkdir_recursive(request->path()->c_str(), mode);
+    } else {
+        ret = mkdir(request->path()->c_str(), mode) == 0;
+    }
+
+    if (!ret) {
+        auto error = builder.CreateString(strerror(errno));
+        response = v3::CreatePathMkdirResponse(builder, false, error);
+    } else {
+        response = v3::CreatePathMkdirResponse(builder, true);
+    }
+
+    // Wrap response
+    v3::ResponseBuilder rb(builder);
+    rb.add_response_type(v3::ResponseType_PathMkdirResponse);
     rb.add_response(response.Union());
     builder.Finish(rb.Finish());
 
@@ -599,7 +760,7 @@ public:
         }
 
         _total += _curr->fts_statp->st_size;
-        _links[dev].emplace(dev);
+        _links[dev].emplace(ino);
 
         return Action::FTS_OK;
     }
@@ -652,9 +813,11 @@ static bool v3_path_get_directory_size(int fd, const v3::Request *msg)
     return v3_send_response(fd, builder);
 }
 
-static void signed_exec_output_cb(const std::string &line, void *data)
+static void signed_exec_output_cb(const char *line, bool error, void *userdata)
 {
-    int *fd_ptr = (int *) data;
+    (void) error;
+
+    int *fd_ptr = (int *) userdata;
     // TODO: Send line
 
     fb::FlatBufferBuilder builder;
@@ -686,8 +849,9 @@ static bool v3_signed_exec(int fd, const v3::Request *msg)
 
     std::string target_binary;
     std::string target_sig;
+    size_t nargs;
+    const char **argv;
     int status;
-    std::vector<std::string> argv;
     SigVerifyResult sig_result;
     bool mounted_tmpfs = false;
     // Variables that are part of the response
@@ -784,23 +948,43 @@ static bool v3_signed_exec(int fd, const v3::Request *msg)
     }
 
     // Build arguments
-    if (request->arg0()) {
-        argv.push_back(request->arg0()->str());
-    } else {
-        argv.push_back(target_binary);
-    }
+    nargs = 2; // argv[0] + NULL-terminator
     if (request->args()) {
-        for (auto const &arg : *request->args()) {
-            argv.push_back(arg->str());
+        nargs += request->args()->size();
+    }
+
+    argv = (const char **) malloc(nargs * sizeof(const char *));
+    if (!argv) {
+        result = v3::SignedExecResult_OTHER_ERROR;
+        error_msg = util::format("%s", strerror(errno));
+        LOGE("%s", error_msg.c_str());
+        goto done;
+    }
+
+    {
+        size_t i = 0;
+        if (request->arg0()) {
+            argv[i++] = request->arg0()->c_str();
+        } else {
+            argv[i++] = target_binary.c_str();
         }
+        if (request->args()) {
+            for (auto const &arg : *request->args()) {
+                argv[i++] = arg->c_str();
+            }
+        }
+        argv[i] = nullptr;
     }
 
     // Run executable
     // TODO: Update libmbutil's command.cpp so the callback can return a bool
     //       Right now, if the connection is broken, the command will continue
     //       executing.
-    status = util::run_command2(target_binary, argv, std::string(),
-                                &signed_exec_output_cb, &fd);
+    status = util::run_command(target_binary.c_str(), argv, nullptr, nullptr,
+                               &signed_exec_output_cb, &fd);
+
+    free(argv);
+
     if (status >= 0 && WIFEXITED(status)) {
         result = v3::SignedExecResult_PROCESS_EXITED;
         exit_status = WEXITSTATUS(status);
@@ -933,7 +1117,7 @@ static bool v3_mb_get_version(int fd, const v3::Request *msg)
     fb::FlatBufferBuilder builder;
 
     // Get version
-    auto version = builder.CreateString(get_mbtool_version());
+    auto version = builder.CreateString(mb::version());
     auto response = v3::CreateMbGetVersionResponse(builder, version);
 
     // Wrap response
@@ -976,7 +1160,7 @@ static bool v3_mb_switch_rom(int fd, const v3::Request *msg)
         return v3_send_response_invalid(fd);
     }
 
-    std::vector<std::string> block_dev_dirs;
+    std::vector<const char *> block_dev_dirs;
 
     if (request->blockdev_base_dirs()) {
         for (auto const &base_dir : *request->blockdev_base_dirs()) {
@@ -990,7 +1174,7 @@ static bool v3_mb_switch_rom(int fd, const v3::Request *msg)
 
     SwitchRomResult ret = switch_rom(request->rom_id()->c_str(),
                                      request->boot_blockdev()->c_str(),
-                                     block_dev_dirs,
+                                     block_dev_dirs.data(),
                                      force_update_checksums);
 
     bool success = ret == SwitchRomResult::SUCCEEDED;
@@ -1203,6 +1387,79 @@ static bool v3_reboot(int fd, const v3::Request *msg)
     return v3_send_response(fd, builder);
 }
 
+static bool v3_shutdown(int fd, const v3::Request *msg)
+{
+    auto request = (v3::ShutdownRequest *) msg->request();
+
+    fb::FlatBufferBuilder builder;
+
+    // The client probably won't get the chance to see the success message, but
+    // we'll still send it for the sake of symmetry
+    bool success = false;
+    switch (request->type()) {
+    case v3::ShutdownType_INIT:
+        success = shutdown_via_init();
+        break;
+    case v3::ShutdownType_DIRECT:
+        success = shutdown_directly();
+        break;
+    default:
+        LOGE("Invalid shutdown type: %d", request->type());
+        return v3_send_response_invalid(fd);
+    }
+
+    // Create response
+    auto response = v3::CreateShutdownResponse(builder, success);
+
+    // Wrap response
+    v3::ResponseBuilder rb(builder);
+    rb.add_response_type(v3::ResponseType_ShutdownResponse);
+    rb.add_response(response.Union());
+    builder.Finish(rb.Finish());
+
+    return v3_send_response(fd, builder);
+}
+
+typedef bool (*request_handler_fn)(int, const v3::Request *);
+
+struct RequestMap
+{
+    v3::RequestType type;
+    request_handler_fn fn;
+};
+
+static RequestMap request_map[] = {
+    { v3::RequestType_CryptoDecryptRequest, v3_crypto_decrypt },
+    { v3::RequestType_CryptoGetPwTypeRequest, v3_crypto_get_pw_type },
+    { v3::RequestType_FileChmodRequest, v3_file_chmod },
+    { v3::RequestType_FileCloseRequest, v3_file_close },
+    { v3::RequestType_FileOpenRequest, v3_file_open },
+    { v3::RequestType_FileReadRequest, v3_file_read },
+    { v3::RequestType_FileSeekRequest, v3_file_seek },
+    { v3::RequestType_FileSELinuxGetLabelRequest, v3_file_selinux_get_label },
+    { v3::RequestType_FileSELinuxSetLabelRequest, v3_file_selinux_set_label },
+    { v3::RequestType_FileStatRequest, v3_file_stat },
+    { v3::RequestType_FileWriteRequest, v3_file_write },
+    { v3::RequestType_PathChmodRequest, v3_path_chmod },
+    { v3::RequestType_PathCopyRequest, v3_path_copy },
+    { v3::RequestType_PathDeleteRequest, v3_path_delete },
+    { v3::RequestType_PathMkdirRequest, v3_path_mkdir },
+    { v3::RequestType_PathSELinuxGetLabelRequest, v3_path_selinux_get_label },
+    { v3::RequestType_PathSELinuxSetLabelRequest, v3_path_selinux_set_label },
+    { v3::RequestType_PathGetDirectorySizeRequest, v3_path_get_directory_size },
+    { v3::RequestType_SignedExecRequest, v3_signed_exec },
+    { v3::RequestType_MbGetBootedRomIdRequest, v3_mb_get_booted_rom_id },
+    { v3::RequestType_MbGetInstalledRomsRequest, v3_mb_get_installed_roms },
+    { v3::RequestType_MbGetVersionRequest, v3_mb_get_version },
+    { v3::RequestType_MbSetKernelRequest, v3_mb_set_kernel },
+    { v3::RequestType_MbSwitchRomRequest, v3_mb_switch_rom },
+    { v3::RequestType_MbWipeRomRequest, v3_mb_wipe_rom },
+    { v3::RequestType_MbGetPackagesCountRequest, v3_mb_get_packages_count },
+    { v3::RequestType_RebootRequest, v3_reboot },
+    { v3::RequestType_ShutdownRequest, v3_shutdown },
+    { v3::RequestType_NONE, nullptr }
+};
+
 bool connection_version_3(int fd)
 {
     std::string command;
@@ -1229,57 +1486,21 @@ bool connection_version_3(int fd)
 
         const v3::Request *request = v3::GetRequest(data.data());
         v3::RequestType type = request->request_type();
+        request_handler_fn fn = nullptr;
+
+        for (auto iter = request_map; iter->fn; ++iter) {
+            if (type == iter->type) {
+                fn = iter->fn;
+                break;
+            }
+        }
 
         // NOTE: A false return value indicates a connection error, not a
         //       command failure!
         bool ret = true;
 
-        if (type == v3::RequestType_FileChmodRequest) {
-            ret = v3_file_chmod(fd, request);
-        } else if (type == v3::RequestType_FileCloseRequest) {
-            ret = v3_file_close(fd, request);
-        } else if (type == v3::RequestType_FileOpenRequest) {
-            ret = v3_file_open(fd, request);
-        } else if (type == v3::RequestType_FileReadRequest) {
-            ret = v3_file_read(fd, request);
-        } else if (type == v3::RequestType_FileSeekRequest) {
-            ret = v3_file_seek(fd, request);
-        } else if (type == v3::RequestType_FileSELinuxGetLabelRequest) {
-            ret = v3_file_selinux_get_label(fd, request);
-        } else if (type == v3::RequestType_FileSELinuxSetLabelRequest) {
-            ret = v3_file_selinux_set_label(fd, request);
-        } else if (type == v3::RequestType_FileStatRequest) {
-            ret = v3_file_stat(fd, request);
-        } else if (type == v3::RequestType_FileWriteRequest) {
-            ret = v3_file_write(fd, request);
-        } else if (type == v3::RequestType_PathChmodRequest) {
-            ret = v3_path_chmod(fd, request);
-        } else if (type == v3::RequestType_PathCopyRequest) {
-            ret = v3_path_copy(fd, request);
-        } else if (type == v3::RequestType_PathSELinuxGetLabelRequest) {
-            ret = v3_path_selinux_get_label(fd, request);
-        } else if (type == v3::RequestType_PathSELinuxSetLabelRequest) {
-            ret = v3_path_selinux_set_label(fd, request);
-        } else if (type == v3::RequestType_PathGetDirectorySizeRequest) {
-            ret = v3_path_get_directory_size(fd, request);
-        } else if (type == v3::RequestType_SignedExecRequest) {
-            ret = v3_signed_exec(fd, request);
-        } else if (type == v3::RequestType_MbGetBootedRomIdRequest) {
-            ret = v3_mb_get_booted_rom_id(fd, request);
-        } else if (type == v3::RequestType_MbGetInstalledRomsRequest) {
-            ret = v3_mb_get_installed_roms(fd, request);
-        } else if (type == v3::RequestType_MbGetVersionRequest) {
-            ret = v3_mb_get_version(fd, request);
-        } else if (type == v3::RequestType_MbSetKernelRequest) {
-            ret = v3_mb_set_kernel(fd, request);
-        } else if (type == v3::RequestType_MbSwitchRomRequest) {
-            ret = v3_mb_switch_rom(fd, request);
-        } else if (type == v3::RequestType_MbWipeRomRequest) {
-            ret = v3_mb_wipe_rom(fd, request);
-        } else if (type == v3::RequestType_MbGetPackagesCountRequest) {
-            ret = v3_mb_get_packages_count(fd, request);
-        } else if (type == v3::RequestType_RebootRequest) {
-            ret = v3_reboot(fd, request);
+        if (fn) {
+            ret = fn(fd, request);
         } else {
             // Invalid command; allow further commands
             ret = v3_send_response_unsupported(fd);

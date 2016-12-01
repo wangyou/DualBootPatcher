@@ -16,6 +16,7 @@ set(MBUTIL_SOURCES
     src/autoclose/dir.cpp
     src/autoclose/file.cpp
     src/archive.cpp
+    src/blkid.cpp
     src/chmod.cpp
     src/chown.cpp
     src/cmdline.cpp
@@ -32,11 +33,15 @@ set(MBUTIL_SOURCES
     src/path.cpp
     src/process.cpp
     src/properties.cpp
+    src/reboot.cpp
     src/selinux.cpp
     src/socket.cpp
     src/string.cpp
     src/time.cpp
     src/vibrate.cpp
+    src/external/system_properties.cpp
+    src/external/system_properties_compat.c
+    external/android_reboot.c
     external/mntent.c
 )
 
